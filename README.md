@@ -12,11 +12,11 @@ Most "build an HTTP server" projects stop at "it can serve a GET request over a 
 
 * **Partial reads** — a request can arrive split across an arbitrary number of `recv()` calls, and the parser must resume correctly from any split point.
 
-* **Two body-framing strategies** (`Content-Length` and `Transfer-Encoding: chunked`), chosen automatically and never sent together.
+* **Two body-framing strategies** — `Content-Length` and `Transfer-Encoding: chunked`, with framing handled explicitly rather than relying on the transport layer.
 
 * **Abuse resistance** at three independent layers: malformed-input rejection, per-IP request rate limiting, and per-IP/global connection admission control.
 
-* Correct **edge-triggered `epoll`** semantics, including a subtle bug class most naive implementations miss (see [Architecture Deep Dive](#architecture-deep-dive)).
+* Correct **edge-triggered `epoll`** semantics, including a subtle admission-control recovery problem that naive implementations can miss.
 
 ---
 
@@ -26,7 +26,7 @@ Most "build an HTTP server" projects stop at "it can serve a GET request over a 
 flowchart TB
 
     subgraph OS["Kernel"]
-        BL["TCP Backlog\n(listen() queue)"]
+        BL["TCP Backlog<br/>(listen queue)"]
     end
 
     subgraph EL["EventLoop (single thread)"]
@@ -34,7 +34,7 @@ flowchart TB
         HA["handle_accept()"]
         HR["handle_client_read()"]
         HW["handle_client_write()"]
-        IT["check_idle_timeouts()\n+ rate limiter sweep"]
+        IT["check_idle_timeouts()<br/>+ rate limiter sweep"]
     end
 
     subgraph TP["ThreadPool (worker threads)"]
@@ -42,30 +42,30 @@ flowchart TB
     end
 
     subgraph GUARDS["Admission Control"]
-        GC["Global connection cap\n(atomic counter)"]
+        GC["Global connection cap<br/>(atomic counter)"]
         IC["Per-IP connection cap"]
-        RL["Per-IP rate limiter\n(token bucket)"]
+        RL["Per-IP rate limiter<br/>(token bucket)"]
     end
 
-    Client["Client"] -->|TCP handshake| BL
+    Client["Client"] -->|TCP connection| BL
     BL --> EP
-    EP -->|server_fd readable| HA
 
+    EP -->|server_fd readable| HA
     HA -->|check| GC
     HA -->|check| IC
-    HA -->|accept + register EPOLLONESHOT| EL
+    HA -->|accept + register| EL
 
     EP -->|client_fd readable| HR
     HR -->|submit job| TP
 
-    W1 -->|parse HTTP request| PARSE["HttpRequestParser\n(state machine)"]
+    W1 -->|parse HTTP request| PARSE["HttpRequestParser<br/>(state machine)"]
 
     PARSE -->|Success| RL
-    RL -->|allowed| ROUTE["HttpRouter::route()"]
-    RL -->|denied| R429["429 response"]
+    RL -->|Allowed| ROUTE["HttpRouter::route()"]
+    RL -->|Denied| R429["429 Response"]
 
     ROUTE --> ENCODE["HttpResponseEncoder::encode()"]
-    ENCODE -->|Content-Length or chunked| WBUF["Connection write buffer"]
+    ENCODE -->|HTTP framing| WBUF["Connection write buffer"]
 
     WBUF --> EP
     EP -->|client_fd writable| HW
@@ -77,98 +77,121 @@ flowchart TB
 
 ### Request lifecycle, end to end
 
-1. **`epoll_wait()`** blocks until a socket is ready for an event such as accept, read, or write.
+1. **`epoll_wait()`** blocks until a registered file descriptor becomes ready for an event such as accept, read, or write.
 
-2. **`handle_accept()`** drains the kernel's backlog: extracts the client IP, checks the **global connection cap** and **per-IP connection cap**, then registers the socket with `EPOLLIN | EPOLLET | EPOLLONESHOT`.
+2. **`handle_accept()`** drains the listening socket, extracts the client IP, checks the **global connection cap** and **per-IP connection cap**, then registers the client socket with `EPOLLIN | EPOLLET | EPOLLONESHOT`.
 
-3. **`handle_client_read()`** hands the actual request-processing work off to the **thread pool** — the epoll thread never blocks on parsing or handler logic.
+3. **`handle_client_read()`** submits request-processing work to the **thread pool** so the epoll thread does not perform expensive parsing or handler logic.
 
-4. A worker thread drains the socket and feeds bytes into **`HttpRequestParser`** — an incremental state machine that can pause and resume mid-request-line, mid-header, or mid-chunk across however many `recv()` calls it takes.
+4. A worker thread drains the socket and feeds bytes into **`HttpRequestParser`** — an incremental state machine that can pause and resume mid-request-line, mid-header, or mid-chunk across multiple `recv()` calls.
 
-5. On a successfully parsed request, the **rate limiter** (token bucket, per source IP) is checked before handler logic runs. Rejected requests receive an immediate `429` response and the connection is closed — the router is never touched.
+5. Once a request is successfully parsed, the **rate limiter** (token bucket, per source IP) is checked before handler logic runs. Rejected requests receive a `429` response and the connection is closed.
 
-6. **`HttpRouter::route()`** dispatches to the matching handler, producing an `HttpResponse`.
+6. **`HttpRouter::route()`** dispatches the request to the matching handler, producing an `HttpResponse`.
 
-7. **`HttpResponseEncoder`** selects `Content-Length` or `Transfer-Encoding: chunked` according to the response encoding rules and serializes the response into the connection's write buffer. `flush()` itself is a byte-pump with no knowledge of HTTP framing.
+7. **`HttpResponseEncoder`** serializes the response and applies the appropriate HTTP body-framing strategy. The encoded bytes are placed into the connection's write buffer. `flush()` only handles sending queued bytes and does not perform HTTP framing.
 
-8. **`EPOLLONESHOT`** re-arms the socket (`EPOLLIN`, plus `EPOLLOUT` if bytes are still queued) so no two worker threads can race on the same connection.
+8. **`EPOLLONESHOT`** is re-armed for the connection. `EPOLLIN` is enabled for further reads, and `EPOLLOUT` is added when queued response data still needs to be sent. This prevents multiple workers from processing the same connection concurrently.
 
-9. A background tick in the main loop (`check_idle_timeouts()`) periodically evicts idle connections and sweeps stale rate-limiter buckets — no separate timer thread is needed.
+9. A periodic tick in the main loop (`check_idle_timeouts()`) removes idle connections and performs rate-limiter maintenance. No separate timer thread is required.
 
 ---
 
 ## Architecture Deep Dive: Three Things That Are Easy to Get Wrong
 
-### 1. Body framing must be mutually exclusive
+### 1. HTTP body framing must be unambiguous
 
-`Content-Length` and `Transfer-Encoding: chunked` must not both be used to frame the same HTTP message. Ambiguous framing can create request-smuggling vulnerabilities.
+`Content-Length` and `Transfer-Encoding: chunked` represent different body-framing mechanisms and must not be used together in an ambiguous HTTP message.
 
-`HttpResponseEncoder` is the single source of truth for the response framing decision and explicitly removes whichever framing header does not apply rather than relying on downstream code to avoid setting both.
+Ambiguous framing can create request-smuggling vulnerabilities.
 
-For requests, the parser separately validates the presence of conflicting `Content-Length` and `Transfer-Encoding` headers and rejects ambiguous framing.
+The `HttpResponseEncoder` is responsible for determining the response framing and ensuring that the generated response does not contain conflicting framing headers.
 
-### 2. Chunked parsing is a state machine, not a loop
+For requests, the parser must independently validate conflicting `Content-Length` and `Transfer-Encoding` headers.
 
-A chunked request body can legally arrive split at **any byte boundary** — mid chunk-size line, mid chunk data, or mid trailing CRLF.
+---
 
-The parser (`HttpRequestParser`) models this as explicit states:
+### 2. Chunked parsing is a state machine, not a simple loop
+
+A chunked request body can legally arrive split at **any byte boundary**:
+
+* in the middle of the chunk-size line
+* in the middle of chunk data
+* between bytes of the terminating CRLF
+* in the trailer section
+
+The `HttpRequestParser` therefore uses explicit states:
 
 ```text
 ChunkSize
-    ↓
+    |
+    v
 ChunkData
-    ↓
+    |
+    v
 ChunkCRLF
-    ↓
+    |
+    v
 ChunkSize
+    |
     ...
-    ↓
+    |
+    v
 Trailers
-    ↓
+    |
+    v
 Complete
 ```
 
-Each state consumes exactly one primitive (`extractLine()` or `extractBytes()`) and either advances or returns `Incomplete` to pause and wait for more data on the next `recv()`.
+Each state consumes the required input using primitives such as `extractLine()` or `extractBytes()`.
 
-The implementation is tested by fragmenting chunked requests **byte-by-byte** across the socket to verify that reassembly remains correct under arbitrary TCP fragmentation.
+If insufficient data is available, parsing returns `Incomplete` and resumes when the next `recv()` provides more bytes.
+
+The implementation is tested by fragmenting chunked requests byte-by-byte across the socket to verify correct behavior under arbitrary TCP fragmentation.
+
+---
 
 ### 3. Edge-triggered epoll + admission control has a recovery trap
 
-If the global connection cap causes `handle_accept()` to stop draining the kernel's backlog early, edge-triggered `epoll` will **not necessarily re-notify** the server while the listening socket remains readable — the readiness edge has already occurred.
+With edge-triggered `epoll`, the listening socket can become readable while the connection limit is already reached.
 
-Left unhandled, this can wedge the accept loop after the server reaches capacity, even after existing connections are released.
+If `handle_accept()` stops draining the listening socket at that point, the server cannot rely on another edge-triggered notification after an existing connection is released. The listening socket may remain readable without producing a new readiness edge.
 
-The fix is for `remove_connection()` to explicitly re-invoke `handle_accept()` after releasing a connection slot. This gives the server a reliable recovery point once capacity becomes available again.
+This can cause the accept loop to become stuck even though connection capacity is available again.
+
+The implementation handles this by having `remove_connection()` trigger another accept attempt after releasing a connection slot.
+
+This gives the server an explicit recovery path when capacity becomes available again.
 
 ---
 
 ## Features
 
-| Layer                            | Feature                                                                                                                      |
-| -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| **I/O**                          | `epoll` (edge-triggered), non-blocking sockets, `EPOLLONESHOT` to prevent cross-thread races                                 |
-| **Concurrency**                  | Thread pool for request processing, epoll thread never blocks                                                                |
-| **HTTP parsing**                 | Incremental state-machine parser, resumable across arbitrary TCP fragmentation                                               |
-| **Body framing**                 | `Content-Length` and `Transfer-Encoding: chunked`, with request and response support                                         |
-| **Malformed input**              | Rejects invalid hex chunk sizes, integer overflow, negative sizes, oversized chunks, and broken CRLF framing — returns `400` |
-| **Rate limiting**                | Per-IP token bucket with steady refill rate and burst capacity                                                               |
-| **Connection admission control** | Per-IP concurrent connection cap, global connection cap via atomic counter, kernel backlog as final backstop                 |
-| **Idle connection reaping**      | Periodic sweep closes connections idle past a configured timeout                                                             |
-| **Graceful shutdown**            | Stops accepting new connections, drains in-flight writes, and uses a bounded shutdown timeout before force-close             |
+| Layer                            | Feature                                                                                                                |
+| -------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| **I/O**                          | `epoll` (edge-triggered), non-blocking sockets, `EPOLLONESHOT`                                                         |
+| **Concurrency**                  | Thread pool for request processing                                                                                     |
+| **HTTP parsing**                 | Incremental state-machine parser, resumable across arbitrary TCP fragmentation                                         |
+| **Body framing**                 | `Content-Length` and `Transfer-Encoding: chunked`                                                                      |
+| **Malformed input**              | Invalid chunk sizes, integer overflow, oversized chunks, broken CRLF framing, and other malformed input return `400`   |
+| **Rate limiting**                | Per-IP token bucket with steady refill rate and burst capacity                                                         |
+| **Connection admission control** | Per-IP connection cap and global connection cap                                                                        |
+| **Idle connection reaping**      | Periodic sweep closes connections idle past a configured timeout                                                       |
+| **Graceful shutdown**            | Stops accepting new connections, drains in-flight writes, and force-closes connections after a bounded shutdown period |
 
 ---
 
 ## Testing
 
-Every feature above was verified with targeted test scripts using raw Python sockets rather than only manual `curl` testing:
+Every feature above was verified with targeted test scripts using raw Python sockets rather than relying only on manual `curl` testing.
 
-* **Chunked encode/decode round-trip**, including byte-by-byte fragmented delivery to force partial-read code paths.
+* **Chunked encode/decode round-trip**, including byte-by-byte fragmented delivery to exercise partial-read code paths.
 
-* **Malformed chunked input**: invalid hex, empty size line, missing CRLF, oversized chunk, integer overflow, and negative-looking size — all confirmed to return `400`.
+* **Malformed chunked input**: invalid hexadecimal values, empty size lines, missing CRLF, oversized chunks, integer overflow, and negative-looking sizes — confirmed to return `400`.
 
-* **Rate limiter**: burst allowance, correct rejection after capacity is exhausted, and token refill/recovery after a cooldown window.
+* **Rate limiter**: burst allowance, rejection after capacity is exhausted, and token refill/recovery after a cooldown period.
 
-* **Connection admission control**: per-IP cap enforcement and — the trickiest case — confirming that the server correctly **resumes accepting connections** after hitting the global cap under edge-triggered `epoll`, rather than silently wedging.
+* **Connection admission control**: per-IP connection-cap enforcement and recovery after hitting the global connection cap under edge-triggered `epoll`.
 
 ---
 
@@ -176,37 +199,56 @@ Every feature above was verified with targeted test scripts using raw Python soc
 
 ```text
 include/
-
-  Http/
-    HttpRequest
-    HttpResponse
-    HttpRequestParser
-    HttpResponseEncoder
-    HttpRouter
-
-  protocol/
-    Framer
-
-  network/
-    Connection
-
-  middleware/
-    RateLimiter
-    PerIpConnectionLimiter
-
-  concurrency/
-    ThreadPool
-
-  Utils/
-    Logger
-    HttpLogGuard
+├── Http/
+│   ├── HttpRequest.h
+│   ├── HttpResponse.h
+│   ├── HttpRequestParser.h
+│   ├── HttpResponseEncoder.h
+│   └── HttpRouter.h
+│
+├── protocol/
+│   └── Framer.h
+│
+├── network/
+│   └── Connection.h
+│
+├── middleware/
+│   ├── RateLimiter.h
+│   └── PerIpConnectionLimiter.h
+│
+├── concurrency/
+│   └── ThreadPool.h
+│
+└── Utils/
+    ├── Logger.h
+    └── HttpLogGuard.h
 
 src/
-
-  ... corresponding .cpp files
+├── Http/
+│   ├── HttpRequest.cpp
+│   ├── HttpResponse.cpp
+│   ├── HttpRequestParser.cpp
+│   ├── HttpResponseEncoder.cpp
+│   └── HttpRouter.cpp
+│
+├── protocol/
+│   └── Framer.cpp
+│
+├── network/
+│   └── Connection.cpp
+│
+├── middleware/
+│   ├── RateLimiter.cpp
+│   └── PerIpConnectionLimiter.cpp
+│
+├── concurrency/
+│   └── ThreadPool.cpp
+│
+└── Utils/
+    ├── Logger.cpp
+    └── HttpLogGuard.cpp
 
 main.cpp
-  Server bootstrap and route registration
 ```
 
 ---
@@ -223,96 +265,15 @@ g++ -std=c++20 -Wall -Wextra -pthread -Iinclude main.cpp src/*/*.cpp -o tcp_serv
 
 ## Roadmap
 
-* [ ] TLS support (OpenSSL)
+* [ ] TLS support with OpenSSL
 * [ ] Range requests / partial content (`206`) for static file serving
-* [ ] HTTP/1.0 vs 1.1 keep-alive default semantics audit
-* [ ] Request-side `Content-Length` + `Transfer-Encoding` smuggling guard (reject if both are present)
-* [ ] Benchmark writeup (requests/sec vs. thread pool size)
+* [ ] HTTP/1.0 vs HTTP/1.1 keep-alive semantics audit
+* [ ] Request-side `Content-Length` + `Transfer-Encoding` smuggling guard
+* [ ] Benchmark writeup: requests/sec vs thread pool size
+* [ ] More comprehensive HTTP compliance testing
 
 ---
 
 ## License
 
 MIT
-
-````
-
-### One thing I deliberately changed
-
-Your original said:
-
-> `MAX_CHUCK_SIZE`
-
-That's almost certainly a typo for `MAX_CHUNK_SIZE`. More importantly, I removed the claim that the encoder chooses chunked **"based on body size"** because that's an implementation policy rather than an HTTP/1.1 requirement. HTTP does **not** require you to use chunked encoding just because a body is large.
-
-Also, your roadmap says:
-
-> Request-side Content-Length + Transfer-Encoding smuggling guard
-
-So if you **haven't implemented that yet**, the README shouldn't claim requests already validate it. That's why I separated request validation from the currently implemented response behavior.
-
-### Save the README
-
-If your file is `README.md`:
-
-```bash
-nano README.md
-````
-
-Paste the corrected README, then:
-
-* `Ctrl + O` → save
-* `Enter` → confirm filename
-* `Ctrl + X` → exit
-
-Or if you're using VS Code, just save with **Ctrl + S**.
-
-### Check what Git sees
-
-From your project root:
-
-```bash
-git status
-```
-
-You should see something like:
-
-```text
-modified: README.md
-```
-
-Then inspect your changes:
-
-```bash
-git diff README.md
-```
-
-If everything looks good:
-
-```bash
-git add README.md
-```
-
-Then commit:
-
-```bash
-git commit -m "docs: update README"
-```
-
-Then push:
-
-```bash
-git push
-```
-
-So the normal workflow is:
-
-```bash
-git status
-git diff
-git add README.md
-git commit -m "docs: update README"
-git push
-```
-
-**Important:** `git add` does not push anything. It stages the change locally. `git commit` records it locally. `git push` sends the commit to your remote repository (such as GitHub).
