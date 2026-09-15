@@ -26,53 +26,54 @@ Most "build an HTTP server" projects stop at "it can serve a GET request over a 
 flowchart TB
 
     subgraph OS["Kernel"]
-        BL["TCP Backlog<br/>(listen queue)"]
+        BL["TCP Backlog (listen queue)"]
     end
 
-    subgraph EL["EventLoop (single thread)"]
-        EP["epoll_wait()"]
-        HA["handle_accept()"]
-        HR["handle_client_read()"]
-        HW["handle_client_write()"]
-        IT["check_idle_timeouts()<br/>+ rate limiter sweep"]
+    subgraph EL["EventLoop - Single Thread"]
+        EP["epoll_wait"]
+        HA["handle_accept"]
+        HR["handle_client_read"]
+        HW["handle_client_write"]
+        IT["check_idle_timeouts"]
     end
 
-    subgraph TP["ThreadPool (worker threads)"]
-        W1["Worker: parse + route + encode"]
+    subgraph TP["ThreadPool - Worker Threads"]
+        W1["Parse, Route, Encode"]
     end
 
     subgraph GUARDS["Admission Control"]
-        GC["Global connection cap<br/>(atomic counter)"]
-        IC["Per-IP connection cap"]
-        RL["Per-IP rate limiter<br/>(token bucket)"]
+        GC["Global Connection Cap"]
+        IC["Per-IP Connection Cap"]
+        RL["Per-IP Rate Limiter"]
     end
 
-    Client["Client"] -->|TCP connection| BL
+    Client["Client"] --> BL
     BL --> EP
 
-    EP -->|server_fd readable| HA
-    HA -->|check| GC
-    HA -->|check| IC
-    HA -->|accept + register| EL
+    EP -->|Readable| HA
+    HA --> GC
+    HA --> IC
+    HA -->|Register Client| EL
 
-    EP -->|client_fd readable| HR
-    HR -->|submit job| TP
+    EP -->|Readable| HR
+    HR -->|Submit Task| TP
+    TP --> W1
 
-    W1 -->|parse HTTP request| PARSE["HttpRequestParser<br/>(state machine)"]
+    W1 --> PARSE["HttpRequestParser"]
+    PARSE --> RL
 
-    PARSE -->|Success| RL
-    RL -->|Allowed| ROUTE["HttpRouter::route()"]
+    RL -->|Allowed| ROUTE["HttpRouter"]
     RL -->|Denied| R429["429 Response"]
 
-    ROUTE --> ENCODE["HttpResponseEncoder::encode()"]
-    ENCODE -->|HTTP framing| WBUF["Connection write buffer"]
+    ROUTE --> ENCODE["HttpResponseEncoder"]
+    ENCODE --> WBUF["Connection Write Buffer"]
 
     WBUF --> EP
-    EP -->|client_fd writable| HW
-    HW -->|flush()| Client
+    EP -->|Writable| HW
+    HW -->|Flush Data| Client
 
-    IT -.->|periodic tick| RL
-    IT -.->|periodic tick| EL
+    IT -.-> RL
+    IT -.-> EL
 ```
 
 ### Request lifecycle, end to end
